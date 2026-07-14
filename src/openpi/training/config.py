@@ -1,4 +1,26 @@
-"""See _CONFIGS for the list of available configs."""
+"""config.py：训练任务的"配置中心"（See _CONFIGS for the list of available configs）。
+
+角色：一次训练要做的所有选择都在这里以"具名 config"（named config，即 TrainConfig 实例）固化下来——
+用哪个模型（π0 / π0.5 / π0-FAST）、在哪个数据集上训、从哪份预训练权重初始化、学习率/batch/步数怎么设、
+数据要过哪些 transform（变换）。所有 config 汇总在文件底部的 _CONFIGS 列表，每个有唯一 name；
+上游 train.py 经 cli()/get_config() 按命令行给的 `<config_name>` 取出对应 TrainConfig，是整个训练链路的总装配图。
+
+三层结构：
+  1) TrainConfig：一次训练的顶层超参集合（model / data / optimizer / lr / batch / checkpoint / weight_loader / freeze 等）。
+  2) DataConfigFactory 及其子类（LeRobotAlohaDataConfig / LeRobotLiberoDataConfig / RLDSDroidDataConfig ...）：
+     运行时 create() 出 DataConfig，内部装配整条数据 transform 链（repack -> data_transforms -> Normalize -> model_transforms）
+     并加载 norm stats（归一化统计量），供 data_loader.py 使用。
+  3) ModelTransformFactory：按模型类型（PI0 / PI05 / PI0_FAST）产出"模型侧 transform"
+     （resize 图像、tokenize prompt/state、pad 动作维度），是区分 π0 与 π0.5 在数据装配上的关键分叉点。
+
+π0 vs π0.5：靠 Pi0Config(pi05=True) 开关区分。pi05_* 系列 config 会把机器人状态离散成文本 token 走语言通道
+（见 ModelTransformFactory 的 PI05 分支 TokenizePrompt(discrete_state_input=...)），并默认改用分位数归一化
+（quantile norm，见 create_base_config 的 use_quantile_norm）。DROID 大规模训练走 RLDS 而非 LeRobot（见 RLDSDroidDataConfig）。
+
+配合：被 scripts/train.py 读取；引用 optimizer.py（LR/优化器配置）、weight_loaders.py（预训练权重加载器）、
+droid_rlds_dataset.py（RLDS 数据源）、transforms 与各机器人 policy。底部 _CONFIGS 有大量结构雷同的 baseline 条目，
+下方只对代表性的 π0.5 条目重点注释，重复条目不逐个展开。
+"""
 
 import abc
 from collections.abc import Sequence
@@ -61,36 +83,48 @@ class AssetsConfig:
     asset_id: str | None = None
 
 
+# DataConfig：一次训练"数据侧"的完整描述。由 DataConfigFactory.create() 产出，
+# data_loader.py 全靠它来建数据集、装 transform、做归一化。三组 transform 的执行顺序见 data_loader.transform_dataset。
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
+    # 数据集标识（本地或 HuggingFace repo）。为 None 时用假数据；"fake" 也代表假数据。
     repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
+    # assets 子目录名，用于定位/保存该数据集的 norm stats（通常等于机器人平台名，如 "trossen"/"droid"）。
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
+    # 预先算好的归一化统计量（均值/方差或分位数）。由 compute_norm_stats.py 生成；None 则不归一化。
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
+    # repack transform：只做键名重映射，把数据集原始字段名对齐到统一命名（images/state/actions/prompt）。最先执行。
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Data transforms, typically include robot specific transformations. Will be applied
     # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
     # normalized data.
+    # data transform：机器人特定处理（各家 policy 的 Inputs/Outputs、动作 delta 化等）。在归一化之前执行。
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Model specific transforms. Will be applied after the data is normalized.
+    # model transform：模型侧处理（resize 图像、tokenize prompt/state、pad 动作维度）。在归一化之后执行。
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    # 归一化方式：True 用分位数归一（对离群值更稳健，π0.5/π0-FAST 默认用），False 用 z-score。
     use_quantile_norm: bool = False
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
+    # 动作序列的键名：data_loader 用这些键 + delta_timestamps 一次取出 action_horizon 帧动作（action chunking）。
     action_sequence_keys: Sequence[str] = ("actions",)
 
     # If true, will use the LeRobot dataset task to define the prompt.
+    # 是否用数据集里的 task 文本当作 prompt（任务指令）。微调时通常置 True。
     prompt_from_task: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
+    # 以下仅 RLDS 加载器（目前只有 DROID 大数据集）用到：数据目录、动作空间、以及多数据集采样权重列表。
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
@@ -103,16 +137,21 @@ class GroupFactory(Protocol):
         """Create a group."""
 
 
+# ModelTransformFactory：按模型类型装配"模型侧 transform"。这是 π0 / π0.5 / π0-FAST 数据处理分道扬镳的地方。
+# 被各 DataConfigFactory 在 create() 里调用，产出 DataConfig.model_transforms（归一化之后、进模型之前的最后一步）。
 @dataclasses.dataclass(frozen=True)
 class ModelTransformFactory(GroupFactory):
     """Creates model transforms for standard pi0 models."""
 
     # If provided, will determine the default prompt that be used by the model.
+    # 默认 prompt：样本没带 prompt 时注入这句（如某任务固定指令）。
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
+                # π0：图像 resize 到 224x224 -> 用 PaliGemma tokenizer 把 prompt 编成文本 token
+                #     -> 把 state/action pad 到模型的 action_dim。state 走连续通道（不离散）。
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -124,6 +163,9 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05:
+                # π0.5：与 π0 几乎一致，关键差异是 TokenizePrompt 多了 discrete_state_input。
+                # π0.5 把机器人状态离散成 256-bin 的文本 token，和 prompt 一起走语言通道（而非单独的连续 state 输入）。
+                # max_token_len 也更大（π0.5 默认 200）以容纳这些额外的 state token。
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
                     inputs=[
@@ -137,6 +179,8 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI0_FAST:
+                # π0-FAST：动作用 FAST tokenizer 编码成离散 token（自回归预测），因此还需要 outputs 侧
+                # 把预测出的 token 解码回连续动作（ExtractFASTActions）。与 flow matching 路线不同。
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
                     if model_config.fast_model_tokenizer is None
@@ -163,6 +207,8 @@ class ModelTransformFactory(GroupFactory):
                 )
 
 
+# DataConfigFactory：DataConfig 的抽象工厂。子类按不同机器人/数据集实现 create()，
+# 装配各自的 transform 链，最后叠加到 create_base_config 提供的公共底座上。
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
@@ -176,14 +222,18 @@ class DataConfigFactory(abc.ABC):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
 
+    # 公共底座：填好 repo_id / asset_id / norm_stats / 归一化方式，子类再往上覆盖三组 transform。
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        # asset_id 默认取 repo_id；也可由 AssetsConfig 指定（例如微调时复用 base 模型的 norm stats）。
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            # 从 assets 目录加载预先算好的 norm stats（支持 gs:// 远程，自动下载）。
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            # 只有原始 π0 用 z-score；π0.5 / π0-FAST 一律用分位数归一化（对离群动作更稳健）。
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -209,6 +259,7 @@ class FakeDataConfig(DataConfigFactory):
         return DataConfig(repo_id=self.repo_id)
 
 
+# SimpleDataConfig：最通用的工厂，data/model transform 都由外部传入的工厂函数现造（见 pi0_droid 等 config）。
 @dataclasses.dataclass(frozen=True)
 class SimpleDataConfig(DataConfigFactory):
     # Factory for the data transforms.
@@ -256,11 +307,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # 输入侧 AlohaInputs / 输出侧 AlohaOutputs：把 Aloha 数据整理成模型格式（推理时反向还原）。
         data_transforms = _transforms.Group(
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
         if self.use_delta_joint_actions:
+            # 把关节动作转成"相对当前状态的增量"（delta），夹爪维保持绝对值。
+            # make_bool_mask(6, -1, 6, -1)：两臂各 6 个关节做 delta（True），各 1 个夹爪保持绝对（-1=False）。
+            # 训练用 delta 更易学（动作幅度小、分布更集中）；推理时用 AbsoluteActions 累加回绝对动作。
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -462,37 +517,52 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+# ============================================================================
+# TrainConfig：一次训练任务的顶层超参集合。train.py 全程只依赖这个对象。
+# 下面逐字段注释；底部 _CONFIGS 里的每个具名条目本质就是给这些字段填不同的值。
+# ============================================================================
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
+    # config 唯一名（命令行按它选 config）。Suppress 表示不暴露给 CLI 覆盖。
     name: tyro.conf.Suppress[str]
     # Project name.
+    # wandb 项目名。
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
+    # 实验名，决定 checkpoint/assets 的子目录，必须在命令行传入（--exp_name=...）。
     exp_name: str = tyro.MISSING
 
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
+    # 模型配置：决定 π0 / π0.5 / π0-FAST 及其结构超参（action_dim、action_horizon、max_token_len、pi05 开关等）。
+    # train.py 用 config.model.create() 建模型，也用它的 action_horizon 驱动 action chunking。
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
+    # 预训练权重加载器（见 weight_loaders.py）。默认 NoOp（从零训）；微调时用 CheckpointWeightLoader 指向 base 模型。
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
     # Optional path to a PyTorch checkpoint to load weights from.
+    # 可选的 PyTorch 权重路径（仅 PyTorch 训练分支用；JAX 训练走上面的 weight_loader）。
     pytorch_weight_path: str | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # 学习率调度与优化器配置（见 optimizer.py）。默认 warmup+cosine + AdamW。
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
+    # EMA 衰减率。None=关闭 EMA（LoRA 微调常关）；0.99/0.999=开启，存档/推理优先用 EMA 权重。
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
+    # freeze 过滤器：指定哪些参数不训练（LoRA 微调时冻结主干，只训 LoRA 分支）。默认 Nothing=不冻结。
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
     # Determines the data to be trained on.
+    # 数据工厂：决定在什么数据集、过哪些 transform 上训练。默认假数据。
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
     # Base directory for config assets (e.g., norm stats).
@@ -501,47 +571,60 @@ class TrainConfig:
     checkpoint_base_dir: str = "./checkpoints"
 
     # Random seed that will be used by random generators during training.
+    # 随机种子：初始化、shuffle、flow matching 的噪声/时间采样都由它派生，保证可复现。
     seed: int = 42
     # Global batch size.
+    # 全局 batch（跨所有设备）。train.py 要求它能被设备数整除。
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
+    # DataLoader 工作进程数。注意：RLDS(DROID) 加载器要求设为 0（其内部自己管多进程）。
     num_workers: int = 2
     # Number of train steps (batches) to run.
+    # 总训练步数（每步一个 batch）。训练按步数而非 epoch 计。
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
+    # 每多少步打印/上报一次指标（loss、grad_norm、param_norm）。
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
+    # 每多少步存一次 checkpoint。
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+    # 里程碑保留：步数为 keep_period 整数倍的 checkpoint 永久保留（默认只留最新 1 个，见 checkpoints.py）。
     keep_period: int | None = 5000
 
     # If true, will overwrite the checkpoint directory if it already exists.
+    # 目录已存在时是否清空重来。
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
+    # 是否从最新 checkpoint 断点续训。与 overwrite 互斥。
     resume: bool = False
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
+    # 透传给推理端 policy server 的元数据（如机器人复位姿态），不影响训练本身。
     policy_metadata: dict[str, Any] | None = None
 
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
+    # FSDP 分片设备数：>1 时把模型参数切到多设备，省单卡显存但可能略慢；其余设备做数据并行。
     fsdp_devices: int = 1
 
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
+        # 该 config 的 assets 目录：<assets_base_dir>/<name>。
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
 
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
+        # checkpoint 目录：<checkpoint_base_dir>/<name>/<exp_name>。
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
@@ -549,14 +632,23 @@ class TrainConfig:
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
         """Get the filter for the trainable parameters."""
+        # 可训练参数 = 是 Param 且不在 freeze_filter 里。train.py 用它挑参数求梯度、建 optimizer 状态。
         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
 
     def __post_init__(self) -> None:
+        # resume 与 overwrite 不能同时开（一个要保留续训、一个要清空）。
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
+# ============================================================================
+# _CONFIGS：全部具名训练/推理 config 的清单。每个条目 = 给 TrainConfig 各字段填一组具体值。
+# 命令行 `python scripts/train.py <name> --exp_name=...` 就是按 name 从这里取。
+# 下面条目很多是不同机器人×数据集的排列组合，结构雷同；重点看含 "pi05" 的条目
+# （π0.5 用 Pi0Config(pi05=True) 打开：状态离散成文本 token、adaRMSNorm 注入 flow 时间、
+#  默认分位数归一化）。有代表性的 π0.5 条目下方给了详细注释，其余同类不再重复。
+# ============================================================================
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -569,6 +661,8 @@ _CONFIGS = [
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
+    # π0.5 版 Aloha：与上面 pi0_aloha 唯一区别是 model 打开 pi05=True，数据/资产完全复用。
+    # 这体现了 π0 与 π0.5 在配置层的最小差异——只切模型开关，transform 装配自动走 PI05 分支。
     TrainConfig(
         name="pi05_aloha",
         model=pi0_config.Pi0Config(pi05=True),
@@ -626,6 +720,8 @@ _CONFIGS = [
             ),
         ),
     ),
+    # π0.5 版 DROID：action_horizon=15（一次预测未来 15 步动作），pi05=True。
+    # data_transforms 用 DroidInputs/Outputs，并把 model_type 透传为 PI05 以走对应 tokenize 逻辑。
     TrainConfig(
         name="pi05_droid",
         model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
@@ -675,6 +771,7 @@ _CONFIGS = [
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
     ),
+    # LoRA 低显存微调示例：主干用 *_lora 变体，配合下面的 freeze_filter 只训 LoRA 分支、冻结主干。
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -690,10 +787,13 @@ _CONFIGS = [
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
+        # 用模型自带的 get_freeze_filter() 生成冻结规则：冻结 LoRA 之外的主干参数，只训 LoRA 低秩增量。
+        # 注意 freeze_filter 的模型变体必须与上面 model 一致，否则冻错参数。
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
+        # LoRA 微调关闭 EMA（可训练参数很少，EMA 收益不大且省显存）。
         ema_decay=None,
     ),
     TrainConfig(
@@ -740,15 +840,22 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+    # ★ 代表性 π0.5 微调 config：在 Libero 数据集上微调 π0.5-base。逐项说明各超参：
     TrainConfig(
         name="pi05_libero",
+        # pi05=True 打开 π0.5；action_horizon=10 一次预测 10 步；
+        # discrete_state_input=False：不把 state 离散成文本 token 塞进 prompt。
+        # 注意：pi05=True 时 embed_suffix 不含连续 state token（见 pi0.py 的 `if not self.pi05` 分支，
+        # 且 __init__ 此时只建 time_mlp、不建 state_proj）。因此本配置两条 state 通路都不走，
+        # 模型仅靠图像 + prompt 预测动作，不使用显式本体状态。
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
+            base_config=DataConfig(prompt_from_task=True),  # 用任务描述当 prompt
+            extra_delta_transform=False,  # Libero 数据已是 delta 动作，无需再套 delta 转换
         ),
         batch_size=256,
+        # 微调用较长 warmup + 几乎恒定 lr（peak=decay=5e-5，decay_steps 远大于实际步数 => cosine 基本走平段）。
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -756,7 +863,8 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        ema_decay=0.999,  # 全量微调保留 EMA
+        # 从 π0.5 base checkpoint 初始化（gs:// 远程自动下载）。
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
@@ -863,6 +971,7 @@ _CONFIGS = [
         # We use RLDS data loading to make training on this large dataset tractable.
         # For fine-tuning on your own DROID dataset, see below.
         name="pi05_full_droid_finetune",
+        # π0.5 全量微调整个 DROID：action_dim=32（π0.5 用 32 维动作空间），action_horizon=16。
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
@@ -970,17 +1079,21 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
 ]
 
+# 强制所有 config 的 name 唯一，并建立 name->config 的查表字典。
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
 def cli() -> TrainConfig:
+    # 命令行入口（train.py 的 main(_config.cli()) 用它）：tyro 把每个具名 config 暴露成子命令，
+    # 选中后还能用 --字段=值 覆盖任意未 Suppress 的字段（如 --exp_name、--batch_size）。
     return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
 
 
 def get_config(config_name: str) -> TrainConfig:
     """Get a config by name."""
+    # 代码里按名字取 config；名字打错时用 difflib 给出最接近的建议。
     if config_name not in _CONFIGS_DICT:
         closest = difflib.get_close_matches(config_name, _CONFIGS_DICT.keys(), n=1, cutoff=0.0)
         closest_str = f" Did you mean '{closest[0]}'? " if closest else ""

@@ -1,5 +1,27 @@
 # ruff: noqa
 
+"""DROID 真机部署客户端：在真实 Franka Panda 上跑策略并做评测的机器人端主程序。
+
+注意这是真机（非仿真）部署入口，运行在机器人本体端的笔记本上，与推理机（GPU 端，见
+scripts/serve_policy.py 起的 websocket 服务）配对使用。它用 droid.robot_env.RobotEnv 直接驱动
+真实的 Franka Panda 机械臂（关节速度 joint_velocity 动作空间 + 夹爪位置 position 动作空间）。
+
+主流程（main）：连接远端策略服务（WebsocketClientPolicy）后，对每条人工输入的语言指令跑一个
+rollout（回合）——按 DROID 采集频率（15 Hz）循环：采当前观测 → 每隔 open_loop_horizon（默认 8）
+步才向服务端查询一次新的动作块（chunk，形如 [10, 8]：7 关节速度 + 1 夹爪），块内动作逐步执行以
+降低通信频率 → 夹爪动作二值化、整体 clip 到 [-1, 1] → env.step 下发到真机。回合结束录制 mp4、
+人工标注成功率、写入 results 的 csv。为避免 Ctrl+C 在等待服务端返回时打断连接，用
+prevent_keyboard_interrupt 上下文管理器把中断延后到服务调用完成。
+
+辅助函数 _extract_observation：从 RobotEnv 观测里挑出左/右/腕相机图像（只用左目立体相机、丢 alpha、
+BGR→RGB）与本体状态（关节位置、夹爪、笛卡尔位姿），并把首帧存盘便于实时查看。图像在机器人端先
+resize_with_pad 到 224×224 再上传，以压缩数据量、降低延迟。
+
+输入：人工键入的指令 + 真机实时观测。输出：下发给 Franka 的动作、录制视频与评测 csv。
+发往服务端的键名（observation/exterior_image_1_left 等）与 policies/droid_policy.py 的
+DroidInputs 对应。
+"""
+
 import contextlib
 import dataclasses
 import datetime

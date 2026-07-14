@@ -1,15 +1,17 @@
-# Run Aloha Sim
+> 本文为 examples/aloha_sim/README.md 的中文翻译，仅供阅读参考，以英文原文为准。
 
-## With Docker
+# 运行 Aloha Sim（仿真）（Run Aloha Sim）
+
+## 使用 Docker（With Docker）
 
 ```bash
 export SERVER_ARGS="--env ALOHA_SIM"
 docker compose -f examples/aloha_sim/compose.yml up --build
 ```
 
-## Without Docker
+## 不使用 Docker（Without Docker）
 
-Terminal window 1:
+终端窗口 1：
 
 ```bash
 # Create virtual environment
@@ -22,13 +24,13 @@ uv pip install -e packages/openpi-client
 MUJOCO_GL=egl python examples/aloha_sim/main.py
 ```
 
-Note: If you are seeing EGL errors, you may need to install the following dependencies:
+注意：如果你看到 EGL 错误，可能需要安装以下依赖：
 
 ```bash
 sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev
 ```
 
-Terminal window 2:
+终端窗口 2：
 
 ```bash
 # Run the server

@@ -1,8 +1,23 @@
-"""
-RLDS-based data loader for DROID.
-While openpi typically uses LeRobot's data loader, it is not currently scalable enough for larger datasets like DROID.
-Thus, we provide a data loader example here that uses the RLDS data format.
+"""droid_rlds_dataset.py：DROID 大规模数据集的 RLDS（Reinforcement Learning Datasets）加载器。
+
+RLDS-based data loader for DROID. While openpi typically uses LeRobot's data loader, it is not currently scalable
+enough for larger datasets like DROID. Thus, we provide a data loader example here that uses the RLDS data format.
 The data loader also applies a few DROID-specific data filters / transformations.
+
+角色：openpi 常用 LeRobot 的随机访问加载器，但它在 DROID 这种量级（约 2000 万帧）上不够 scalable，
+因此这里提供一条基于 RLDS / tf.data 的可迭代流式加载路径。上游由 config.py 的 RLDSDroidDataConfig / data_loader.py 的
+create_rlds_dataset 使用；产出：逐个 (observation, actions, prompt) 帧样本组成的 batch，供上层 transform 链继续处理。
+π0.5 的 DROID 训练即走这条 RLDS 路径（与 LeRobot 路径二选一）。
+
+关键类型：
+  - DroidActionSpace（Enum）：动作空间选择，JOINT_POSITION（关节位置，默认，便于仿真评测）或 JOINT_VELOCITY（关节速度）。
+  - RLDSDataset（dataclass）：单个子数据集的声明（name / version / 采样 weight / 可选 filter_dict_path 帧级过滤字典）。
+  - DroidRldsDataset：核心加载器。__init__ 内按子数据集构建 tf.data 流水线：只保留成功轨迹（文件名含 "success"）->
+    可选按 filter dict 做帧级 idle 过滤（用 StaticHashTable 查表）-> restructure（重排 observation/action 键、
+    随机选一路外部相机与一条语言指令）-> chunk_actions（把每步扩成未来 action_chunk_size 步的动作块，末尾重复最后一帧）->
+    flatten 成逐帧样本 -> 解码图像 -> 多子数据集按权重混采 -> shuffle -> batch。__iter__ 产出 numpy batch，
+    __len__ 返回过滤后约 20,000,000 的近似样本数（硬编码）。
+说明：tensorflow / dlimp / tfds 在 __init__ 内延迟导入，并禁用 TF 的 GPU，避免与 JAX/PyTorch 争抢显存。
 """
 
 from collections.abc import Sequence

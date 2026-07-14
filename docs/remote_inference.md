@@ -1,36 +1,37 @@
+> 本文为 docs/remote_inference.md 的中文翻译，仅供阅读参考，以英文原文为准。
 
-# Running openpi models remotely
+# 远程运行 openpi 模型（Running openpi models remotely）
 
-We provide utilities for running openpi models remotely. This is useful for running inference on more powerful GPUs off-robot, and also helps keep the robot and policy environments separate (and e.g. avoid dependency hell with robot software).
+我们提供了远程运行 openpi 模型的工具。这对于在机器人之外、更强大的 GPU 上运行推理（inference）很有用，同时也有助于让机器人环境与策略（policy）环境保持分离（从而例如避免与机器人软件之间的依赖地狱 dependency hell）。
 
-## Starting a remote policy server
+## 启动远程策略服务器（Starting a remote policy server）
 
-To start a remote policy server, you can simply run the following command:
+要启动一个远程策略服务器，你只需运行以下命令：
 
 ```bash
 uv run scripts/serve_policy.py --env=[DROID | ALOHA | LIBERO]
 ```
 
-The `env` argument specifies which $\pi_0$ checkpoint should be loaded. Under the hood, this script will execute a command like the following, which you can use to start a policy server, e.g. for checkpoints you trained yourself (here an example for the DROID environment):
+`env` 参数指定应加载哪个 $\pi_0$ 检查点（checkpoint）。在底层，该脚本会执行类似下面的命令，你可以用它来启动一个策略服务器，例如用于你自己训练的检查点（这里以 DROID 环境为例）：
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_droid --policy.dir=gs://openpi-assets/checkpoints/pi0_fast_droid
 ```
 
-This will start a policy server that will serve the policy specified by the `config` and `dir` arguments. The policy will be served on the specified port (default: 8000).
+这会启动一个策略服务器，提供由 `config` 和 `dir` 参数指定的策略。该策略将在指定端口（默认：8000）上提供服务。
 
-## Querying the remote policy server from your robot code
+## 从你的机器人代码查询远程策略服务器（Querying the remote policy server from your robot code）
 
-We provide a client utility with minimal dependencies that you can easily embed into any robot codebase.
+我们提供了一个依赖极少的客户端工具，你可以轻松地将其嵌入任何机器人代码库。
 
-First, install the `openpi-client` package in your robot environment:
+首先，在你的机器人环境中安装 `openpi-client` 包：
 
 ```bash
 cd $OPENPI_ROOT/packages/openpi-client
 pip install -e .
 ```
 
-Then, you can use the client to query the remote policy server from your robot code. Here's an example of how to do this:
+然后，你就可以使用该客户端从机器人代码中查询远程策略服务器。下面是一个如何操作的示例：
 
 ```python
 from openpi_client import image_tools
@@ -68,4 +69,4 @@ for step in range(num_steps):
 
 ```
 
-Here, the `host` and `port` arguments specify the IP address and port of the remote policy server. You can also specify these as command-line arguments to your robot code, or hard-code them in your robot codebase. The `observation` is a dictionary of observations and the prompt, following the specification of the policy inputs for the policy you are serving. We have concrete examples of how to construct this dictionary for different environments in the [simple client example](../examples/simple_client/main.py).
+这里，`host` 和 `port` 参数指定了远程策略服务器的 IP 地址和端口。你也可以把它们指定为机器人代码的命令行参数，或在机器人代码库中硬编码。`observation` 是一个包含观测和提示（prompt）的字典，遵循你所提供服务的策略的策略输入规范。我们在[simple client 示例](../examples/simple_client/main.py)中提供了针对不同环境如何构造这个字典的具体示例。
